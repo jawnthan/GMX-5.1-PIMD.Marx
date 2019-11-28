@@ -241,8 +241,8 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
     int icg, n0, n1, n, nrcg, k, m, g, a, b, fp, bp;
     rvec * qv; /*velocity in nm space*/
     rvec * qx; /*coordintates in nm space*/
-    rvec * fh; /*forces without harmonic ring interactions*/
-    rvec * qvnew; 
+    rvec * qf; /*force in nm space*/
+    rvec * fh; 
     t_grpopts *opts = &inputrec->opts;
     t_grp_tcstat *tcstat = ekind->tcstat;
     t_grp_acc *grpstat = ekind->grpstat;
@@ -376,20 +376,20 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
             {
     	        if ((ptype[n] != eptVSite) && (ptype[n] != eptShell) && !nFreeze[gf][d])
     		{
-             	    real qv;
+             	    real qv_temp;
                     sd_V = ism*sig[gt].V*rnd[d];
 
 		    if (k > 0)
 		    {
 		        kk       = md->massT[n] * omg * omg;
 			qf[k][d] = qf[k][d] - kk * fr->adress_NM_mu[k] * qx[k][d];
-			qv       = qv[k][d] + ((invmass[n] / fr->adress_NM_mu[k]) * qf[k][d])*dt;
-			qv[k][d] = qv*sdc[gt].em + sd_V;
+			qv_temp  = qv[k][d] + ((invmass[n] / fr->adress_NM_mu[k]) * qf[k][d])*dt;
+			qv[k][d] = qv_temp*sdc[gt].em + sd_V;
 		    }
 		    else
 		    {
-			qv       = qv[k][d] + (invmass[n] * qf[k][d])*dt;
-			qv[k][d] = qv*sdc[gt].em + sd_V;
+			qv_temp  = qv[k][d] + (invmass[n] * qf[k][d])*dt;
+			qv[k][d] = qv_temp*sdc[gt].em + sd_V;
 		    }
 		}
 		else
@@ -537,7 +537,7 @@ void InitNMMatrix(int P, t_forcerec *fr)
 	for (j = 0; j < P; j++)
 	{
 	    fr->adress_NM_M[i][j] = (cos(twopi * i * j * invP) -
-			             sin(twopi * i * i * invP) * sqrt(invP);
+			             sin(twopi * i * i * invP)) * sqrt(invP);
 	}
     }
     
