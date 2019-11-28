@@ -180,16 +180,19 @@ void calc_force_on_cg(int cg0, int cg1, t_block * cgs, rvec x[], t_forcerec * fr
 
 static void nm_transform(rvec *x, rvec *u, int P, t_forcerec * fr)
 {
-    int i, j, d, k;
+    int i, j, d;
+
+    real fac = sqrt(1./P);
+
     for (d = 0; d < DIM; d++)
     {
-        for (k = 0; k < P; k++)
+        for (i = 0; i < P; i++)
        	{
-            u[k][d] = 0;
+            u[i][d] = 0;
 
             for (j = 0; j < P; j++) 
 	    {
-                u[k][d] += fr->adress_NM_M[j][k] * x[j][d];
+                u[i][d] += fac * fr->adress_NM_M[i][j] * x[j][d];
             }
         }
     }
@@ -197,16 +200,19 @@ static void nm_transform(rvec *x, rvec *u, int P, t_forcerec * fr)
 
 static void inverse_nm_transform(rvec *x, rvec *u, int P, t_forcerec * fr)
 {
-    int i, j, d, k;
+    int i, j, d;
+
+    real fac = sqrt(P);
+
     for (d = 0; d < DIM; d++)
     {
-        for (j = 0; j < P; j++)
+        for (i = 0; i < P; j++)
        	{
-            u[j][d] = 0;
+            u[i][d] = 0;
 
-            for (k = 0; k < P; k++)
+            for (j = 0; j < P; j++)
 	    {
-                u[j][d] += fr->adress_NM_M[j][k] * x[k][d];
+                u[i][d] += fac * fr->adress_NM_M[i][j] * x[j][d];
 	    }
         }
     }
@@ -243,7 +249,7 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
     real dekindl;
     real hm, kk;
     dekindl = 0;
-    real omg = (BOLTZ*ref_t[0]*2*M_PI)/PLANCK;
+    real omg = (sqrt(fr->n_pi_grps) * BOLTZ*ref_t[0]*2*M_PI)/PLANCK;
 
 //    printf("cg0 %d, cg1 %d\n", cg0, cg1);
     
@@ -251,15 +257,11 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
     
     snew(qv, fr->n_pi_grps);
     snew(qx, fr->n_pi_grps);
+    snew(qf, fr->n_pi_grps);
     snew(fh, fr->n_pi_grps);
-    snew(qvnew, fr->n_pi_grps);
+
     sdc = sd->sdc;
     sig = sd->sdsig;
-
-/*	printf("hibefore\n");
-	printf("sdc.em = %f\n", sdc[0].em);
-	printf("hiafter\n");
-*/
 
     if (nrend > sd->sd_V_nalloc)
     {
@@ -269,7 +271,6 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
 
     for(n = 0; n < ngtc; n++)
     {
-        //printf("n = %d\n", n);
     	kT = BOLTZ*ref_t[n];
     	/* The mass is accounted for later, since this differs per atom */
     	sig[n].V  = sqrt(kT*(1 - sdc[n].em * sdc[n].em));
@@ -278,19 +279,19 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
     /* for kinetic energy*/
     for (g = 0; (g < opts->ngtc); g++)
     {
-        copy_mat(tcstat[g].ekinh,tcstat[g].ekinh_old);
+        copy_mat(tcstat[g].ekinh, tcstat[g].ekinh_old);
     	clear_mat(tcstat[g].ekinh);
     }
 
 
     /******************NEW IMPLEMENTATION****************/
-    //printf("cg0 %d cg1 %d n1 %d n2 %d \n", cg0, cg1, cgindex[cg0], cgindex[cg1]);
+    
     for (icg = cg0; (icg < cg1); icg++) 
     {
         n0 = cgindex[icg];
     	n1 = cgindex[icg + 1];
-//	printf("n0 %d, n1 %d\n", n0, n1);
-    	/* loop over all atoms in cg*/
+    	
+	/* loop over all atoms in cg*/
         nrcg = n1 - n0;
         if (nrcg == 1)
        	{
@@ -299,11 +300,43 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
                 v[n0][d] = 0.0;
                 xprime[n0][d] = x[n0][d];
             }
-            continue;
+            continue; /* if only one atom is in cg, it is a vsite... we can ignore for now */
         }
+
+	
+        for (n = n0; (n < n1); n++) 
+        {
+	    kk = md->massT[n] * omg * omg;
+	    fp = n + 1;
+
+	    if (fp == n1)
+	    {
+	        fp = n0;
+	    }
+
+	    bp = n - 1;
+
+	    if (bp < n0)
+	    {
+	        bp = n1 - 1;
+	    }
+
+	    for (d = 0; d < DIM; d++)
+	    {
+		fdd         = -kk * (x[n][d] - x[fp][d]);
+		bdd         = -kk * (x[bp][d] - x[n][d]);
+		fh[n-n0][d] = f[n][d] - fdd + bdd;
+	    }
+	}
+
+	nm_transform(&v[n0], qv, fr->n_pi_grps, fr);
+	nm_transform(&x[n0], qx, fr->n_pi_grps, fr);
+        inverse_nm_transform(&fh[n0], qf, fr->n_pi_grps, fr);
     
         for (n = n0; (n < n1); n++) 
         {
+
+	    k = n - n0;
     
     	    if (cFREEZE)
 	    {
@@ -318,125 +351,101 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
     		gt = cTC[n];
     	    }
     
+	    /* set up random number stuff */
+
     	    real rnd[3];
     	    int ng = gatindex ? gatindex[n] : n;
-    	    ism = sqrt(invmass[n]);
-            kk = md->massT[n] * omg * omg;                                              
-    //      printf("kk %f \n", kk);
-    
-    	    fp = n + 1;
-            if (fp == n1)
-	    {
-                fp = n0;
-	    }
-    
-    	    bp = n - 1;
-            if (bp < n0)
-	    {
-                bp = n1 - 1;
-	    }
-    
-//    	    printf("n0 %d n1 %d n %d fp %d bp %d \n", n0, n1, n, fp, bp);
-    		
     	    gmx_rng_cycle_3gaussian_table(step, ng, seed, RND_SEED_UPDATE, rnd);
+
+	    /* scale the inverse squareroot mass by the eigenvalue
+	     * if the current bead in the loop is greater than the first.
+	     * else, do not scale the inverse squareroot mass */
+
+	    if (k > 0)
+	    {
+	        ism = sqrt(invmass[n] / fr->adress_NM_mu[k]);
+	    }
+	    else
+	    {
+		ism = sqrt(invmass[n]);
+	    }
     
-    	    /* velocity update step in real space*/
+    	    /* velocity update step in nm space*/
+
     	    for (d = 0; d < DIM; d++)
-    	    {
+            {
     	        if ((ptype[n] != eptVSite) && (ptype[n] != eptShell) && !nFreeze[gf][d])
     		{
-             	    real vn;
-    
-                    fdd = -kk * (x[n][d] - x[fp][d]);
-                    bdd = -kk * (x[bp][d] - x[n][d]);
-                    fh[n-n0][d] = f[n][d] - fdd + bdd;
-                    // printf("n %d dim %d force %f \n", n, d, fh[n-n0][d]);
+             	    real qv;
                     sd_V = ism*sig[gt].V*rnd[d];
-    		    vn   = v[n][d] + (invmass[n]*fh[n-n0][d] + accel[ga][d])*dt;
-    		    /* sdc.em is defined as exp(-delta_t/tau) in update.c */ // ???
-    		    v[n][d] = vn*sdc[gt].em + sd_V;   
-    		}
-                else
-                {
-                    v[n][d] = 0.0; 
-                } 
-    	    }
-        }   
-        
-   	//   printf("before %d %f %f %f \n", n0, v[n0][0], v[n0][1], v[n0][2]);
-    	/* transform velocities and positions to nm space*/
-   
-	nm_transform(&v[n0], qv, fr->n_pi_grps, fr);
-	nm_transform(&x[n0], qx, fr->n_pi_grps, fr);
-    	
-	/* evolution of a free ring polymer*/
-    	for (n = n0; n < n1; n++)
-       	{
-            k = n - n0;
-            hm = 0.5 * md->massT[n];
-          
-   //       real omg = (fr->n_pi_grps*BOLTZ*ref_t[0]*2*M_PI*md->massT[n])/PLANCK;
-           
-	    if (cFREEZE)
+
+		    if (k > 0)
+		    {
+		        kk       = md->massT[n] * omg * omg;
+			qf[k][d] = qf[k][d] - kk * fr->adress_NM_mu[k] * qx[k][d];
+			qv       = qv[k][d] + ((invmass[n] / fr->adress_NM_mu[k]) * qf[k][d])*dt;
+			qv[k][d] = qv*sdc[gt].em + sd_V;
+		    }
+		    else
+		    {
+			qv       = qv[k][d] + (invmass[n] * qf[k][d])*dt;
+			qv[k][d] = qv*sdc[gt].em + sd_V;
+		    }
+		}
+		else
+		{
+                    qv[k][d] = 0.0;
+		}
+	    }
+
+	    /* calculate KE */
+
+	    hm = 0.5 * md->massT[n];
+
+	    if (k > 0)
 	    {
-                gf = cFREEZE[n];
-            }
-            if (cACC)
+	        for (d = 0; (d < DIM); d++)
+		{
+	            for (m = 0; (m < DIM); m++)
+		    {
+			tcstat[gt].ekinh[m][d] += hm * fr->adress_NM_mu[k] * qv[k][m] * qv[k][d];
+		    }
+		}
+	    }
+	    else
 	    {
-                ga = cACC[n];
-            }
-            if (cTC)
+		for (d = 0; (d < DIM); d++)
+		{
+	            for (m = 0; (m < DIM); m++)
+		    {
+			tcstat[gt].ekinh[m][d] += hm * qv[k][m] * qv[k][d];
+		    }
+		}
+	    }
+	}
+
+	for (n = n0; (n < n1); n++)
+	{
+	    k = n - n0;
+	    for (d = 0; (d < DIM); d++)
 	    {
-                gt = cTC[n];
-            }
-    
-            for (d = 0; d < DIM; d++) 
-	    {
-    	        if ((ptype[n] != eptVSite) && (ptype[n] != eptShell) && !nFreeze[gf][d])
-	       	{
-                    if (k == 0)
-                    {
-                        qvnew[k][d] = qv[k][d];
-                        qx[k][d] = qv[k][d]*dt + qx[k][d]; 
-                    }
-                    else
-                    {  
-                        qvnew[k][d] = cos(fr->adress_NM_mu[k]*omg*dt) * qv[k][d] - omg * fr->adress_NM_mu[k] * 
-				      sin(omg * fr->adress_NM_mu[k]*dt) *qx[k][d];
-                        
-			qx[k][d] = (1/(fr->adress_NM_mu[k]*omg)) * sin(fr->adress_NM_mu[k] * omg * dt) *
-                                   qv[k][d] + cos(fr->adress_NM_mu[k] * omg * dt) * qx[k][d];
-                    }
-                    
-		    qv[k][d] = qvnew[k][d];                                      
-    		} 
-    	    }
-                   
-                /*    for (d = 0; (d < DIM); d++) {
-                            for (m = 0; (m < DIM); m++) {
-                                    tcstat[gt].ekinh[m][d] += hm * qv[k][m] * qv[k][d];// + hm * fr->adress_NM_mu[k]* omg * fr->adress_NM_mu[k] * omg * qx[k][m] * qx[k][d]);
-                            }
-                    }*/
-                  
-              
-        }
-    
-    /* transform velocities and coordinates back to real space*/
-    inverse_nm_transform(qv, &v[n0], fr->n_pi_grps, fr);
-    inverse_nm_transform(qx, &xprime[n0], fr->n_pi_grps, fr);
-               
- // printf("after %d %f %f %f \n", n0, v[n0][0], v[n0][1], v[n0][2]);
-    
-    } 
-    
+	        qx[n][d] = qx[k][d] + qv[k][d]*dt;
+	    }
+	}
+
+	/* transform back to real space */
+
+	inverse_nm_transform(qv, &v[n0], fr->n_pi_grps, fr);
+	inverse_nm_transform(qx, &xprime[n0], fr->n_pi_grps, fr);
+    }
     
     ekind->dekindl = dekindl;
     inc_nrnb(nrnb, eNR_EKIN, nrend);
     
     sfree(qv);
-    sfree(qvnew);
     sfree(qx);
     sfree(fh);
+    sfree(qf);
 }
 
 void update_coords_nm(
@@ -509,11 +518,13 @@ void update_coords_nm(
 
 void InitNMMatrix(int P, t_forcerec *fr)
 {
-    int i, j, n, k;
+    int i, j, n;
 
     real invP= 1.0/P;
     real twopi=M_PI*2.0;
-//   real omg = P*BOLTZ*ref_[t]*twopi/PLANK; 
+    
+    /* build matrix which diagonalizes the spring matrix */
+
     snew(fr->adress_NM_M, P);
 
     for(i=0; i< P;i++)
@@ -521,38 +532,22 @@ void InitNMMatrix(int P, t_forcerec *fr)
         snew(fr->adress_NM_M[i], P);
     }
 
+    for (i = 0; i < P; i++)
+    {
 	for (j = 0; j < P; j++)
-       	{
-            for (k = 0; k < P; k++)
-	    {
-                        
-                if (k == 0)
-                {
-                    fr->adress_NM_M[j][k] = sqrt(invP);
-                }
-                else if (k >= 1 && k <= (P/2 - 1))
-                {
-                    fr->adress_NM_M[j][k] = sqrt(2*invP)*cos(twopi*k*(j+1)*invP);
-                }   
-                else if (k == P/2)
-                { 
-                    fr->adress_NM_M[j][k] = sqrt(invP)*pow(-1, j+1); 
-                }
-                else 
-                {
-                    fr->adress_NM_M[j][k] = sqrt(2*invP)*sin(twopi*k*(j+1)*invP);
-                }
-		//	fr->adress_NM_M[i][j]=(cos(twopi* i * j * invP) - sin(twopi*  i * j * invP))*sqrt(invP);
-                    printf("j = %d k = %d fr->adress_NM_M[j][k] = %f \n", j, k, fr->adress_NM_M[j][k]); 
-	    }
+	{
+	    fr->adress_NM_M[i][j] = (cos(twopi * i * j * invP) -
+			             sin(twopi * i * i * invP) * sqrt(invP);
 	}
+    }
     
+    /* build eigenvalue array */
+
     snew(fr->adress_NM_mu, P);
 
     for (i = 0; i < P; i++) 
     {
-	fr->adress_NM_mu[i]=2.0*(sin(M_PI*i/P));
- //       printf("fr->adress_NM_mu[i] = %f time = %f \n", fr->adress_NM_mu[i], 2*M_PI/(fr->adress_NM_mu[i]));
+	fr->adress_NM_mu[i] = 2.0 * P * (1 - cos(twopi * i / P));
     }
 
 }
