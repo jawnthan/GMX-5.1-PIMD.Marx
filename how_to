@@ -1,0 +1,1 @@
+cmake .. -DCMAKE_INSTALL_PREFIX=/home/mi/ck69giso/gmx_5.1_n_w -DGMX_BUILD_OWN_FFTW=ON -DCMAKE_CXX_COMPILER=/import/gcc/5.2/bin/g++  -DCMAKE_C_COMPILER=/import/gcc/5.2/bin/gcc -DGMX_GPU=OFF build on zatar.info

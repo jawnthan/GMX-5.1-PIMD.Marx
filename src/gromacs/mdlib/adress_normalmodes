@@ -1,0 +1,436 @@
+#include "maths.h"
+#include "pbc.h"
+#include "types/simple.h"
+#include "typedefs.h"
+#include "vec.h"
+#include "adress_normalmodes.h"
+#include "update.h"
+#include "smalloc.h"
+#include "types/state.h"
+#include "partdec.h"
+#include "types/commrec.h"
+#include "nrnb.h"
+
+#define PARTDECOMP(cr)     ((cr)->pd != NULL)
+
+#include "vec.h"
+#include "adress_normalmodes.h"
+#include "update.h"
+#include "smalloc.h"
+#include "types/state.h"
+#include "partdec.h"
+#include "types/commrec.h"
+#include "nrnb.h"
+#include "gmx_wallcycle.h"
+#include "gmx_omp_nthreads.h"
+#include "gmx_omp.h"
+
+#define PARTDECOMP(cr)     ((cr)->pd != NULL)
+
+typedef struct {
+	double gdt;
+	double eph;
+	double emh;
+	double em;
+	double b;
+	double c;
+	double d;
+} gmx_sd_const_t;
+
+typedef struct {
+	real V;
+	real X;
+	real Yv;
+	real Yx;
+} gmx_sd_sigma_t;
+
+
+typedef struct {
+    /* The random state for ngaussrand threads.
+     * Normal thermostats need just 1 random number generator,
+     * but SD and BD with OpenMP parallelization need 1 for each thread.
+     */
+    int             ngaussrand;
+    gmx_rng_t       *gaussrand;
+    /* BD stuff */
+    real           *bd_rf;
+    /* SD stuff */
+    gmx_sd_const_t *sdc;
+    gmx_sd_sigma_t *sdsig;
+    rvec           *sd_V;
+    int             sd_V_nalloc;
+    /* andersen temperature control stuff */
+    gmx_bool       *randomize_group;
+    real           *boltzfac;
+} gmx_stochd_t;
+
+typedef struct gmx_update
+{
+	gmx_stochd_t *sd;
+	rvec *xp;
+	int  xp_nalloc;
+	/* Variables for the deform algorithm */
+	gmx_large_int_t deformref_step;
+	matrix     deformref_box;
+} t_gmx_update;
+
+static rvec *get_xprime(const t_state *state,gmx_update_t upd)
+{
+	if (state->nalloc > upd->xp_nalloc)
+	{
+		upd->xp_nalloc = state->nalloc;
+		srenew(upd->xp,upd->xp_nalloc);
+	}
+	return upd->xp;
+}
+
+void calc_force_on_cg(int cg0, int cg1, t_block * cgs, rvec x[], t_forcerec * fr, t_mdatoms * mdatoms, rvec f[])
+{
+	int            i, icg,k,k0,k1,d, nrcg;
+	atom_id *      cgindex=cgs->index;;
+	rvec fsum;
+
+	for (i = 0; i < mdatoms->nr; i++) {
+		mdatoms->ring_force[i][0] = 0.0;
+		mdatoms->ring_force[i][1] = 0.0;
+		mdatoms->ring_force[i][2] = 0.0;
+	}
+
+	for(icg=cg0; (icg<cg1); icg++)
+	{
+		k0      = cgindex[icg];
+		k1      = cgindex[icg+1];
+		nrcg    = k1-k0;
+		fsum[0] = 0.0;
+		fsum[1] = 0.0;
+		fsum[2] = 0.0;
+
+		/* calculate sum all forces on a cg*/
+		for(k=k0; (k<k1); k++)
+		{
+			fsum[0]+=f[k][0];
+			fsum[1]+=f[k][1];
+			fsum[2]+=f[k][2];
+		}
+
+		/* store sum in mdatos struct*/
+		for(k=k0; (k<k1); k++){
+			mdatoms->ring_force[k][0]=fsum[0];
+			mdatoms->ring_force[k][1]=fsum[1];
+			mdatoms->ring_force[k][2]=fsum[2];
+		}
+	}
+}
+
+
+static void nm_transform(rvec *x, rvec *u, int P, t_forcerec * fr)
+{
+        int i, j, d;
+        for (d = 0; d < DIM; d++) {
+                for (i = 0; i < P; i++) {
+                        u[i][d] = 0;
+                        for (j = 0; j < P; j++) {
+                                u[i][d] += fr->adress_NM_M[i][j] * x[3*j][d];
+                        }
+                }
+        }
+}
+
+static void inverse_nm_transform(rvec *x, rvec *u, int P, t_forcerec * fr)
+{
+                int i, j, d;
+                        for (d = 0; d < DIM; d++) {
+                                for (i = 0; i < P; i++) {
+                                     u[3*i][d] = 0;
+                                     for (j = 0; j < P; j++) {
+                                             u[3*i][d] += fr->adress_NM_M[j][i] * x[j][d];                                                                       }
+                                }
+                        }
+}
+
+
+static void do_update_sd1_nm(gmx_stochd_t *sd, gmx_rng_t gaussrand, 
+		          int start,int nrend,double dt,
+			  rvec accel[],ivec nFreeze[],
+			  real invmass[],unsigned short ptype[],
+			  unsigned short cFREEZE[],unsigned short cACC[],
+			  unsigned short cTC[],
+			  rvec x[],rvec xprime[],rvec v[],rvec f[],
+			  rvec sd_X[],
+			  int ngtc,real tau_t[],real ref_t[],
+			  int cg0, int cg1, t_block *  cgs, t_commrec    *cr, 
+			  t_forcerec *fr, gmx_ekindata_t *ekind, t_nrnb *nrnb,
+			  t_mdatoms    *md,  t_inputrec   *inputrec) {
+	gmx_sd_const_t *sdc;
+	gmx_sd_sigma_t *sig;
+	real kT;
+	int gf = 0, ga = 0, gt = 0;
+	real ism, sd_V;
+	int d;
+	atom_id * cgindex=cgs->index;;
+	int icg, n0, n1, n, nrcg, k, m, g, a, b;
+	rvec * qv; /*velocity in nm space*/
+	rvec * qx; /*coordintates in nm space*/
+        rvec * qvnew; 
+	t_grpopts *opts = &inputrec->opts;
+	t_grp_tcstat *tcstat = ekind->tcstat;
+	t_grp_acc *grpstat = ekind->grpstat;
+	real dekindl;
+	real hm;
+	dekindl = 0;
+        real omg = fr->n_pi_grps*BOLTZ*ref_t[0]/PLANCK;
+// 	printf( "do_update_sd1_nm omg %f \n", omg);
+	
+	snew(qv, fr->n_pi_grps);
+ 	snew(qx, fr->n_pi_grps);
+        snew(qvnew, fr->n_pi_grps);
+	sdc = sd->sdc;
+	sig = sd->sdsig;
+	if (nrend > sd->sd_V_nalloc)
+	{
+		 sd->sd_V_nalloc = over_alloc_dd(nrend);
+		 srenew(sd->sd_V,sd->sd_V_nalloc);
+	}
+	for(n = 0; n < ngtc; n++)
+	{
+		kT = BOLTZ*ref_t[n];
+		/* The mass is encounted for later, since this differs per atom */
+		sig[n].V  = sqrt(2*kT*(1 - sdc[n].em));
+	}
+	/* for kinetic energy*/
+	for (g = 0; (g < opts->ngtc); g++) {
+		copy_mat(tcstat[g].ekinh,tcstat[g].ekinh_old);
+		clear_mat(tcstat[g].ekinh);
+	}
+
+	/******************NEW IMPLEMENTATION****************/
+
+	for (icg = cg0; (icg < cg1); icg++) {
+		n0 = cgindex[icg];
+		n1 = cgindex[icg + 1];
+		/* loop over all atoms in cg*/
+
+		for (n = n0; (n < n1); n++) {
+
+			if (cFREEZE) {
+				gf = cFREEZE[n];
+			}
+			if (cACC) {
+				ga = cACC[n];
+			}
+			if (cTC) {
+				gt = cTC[n];
+			}
+		        ism = sqrt(invmass[n]); 
+			/* velocity update step in nm space*/
+			for (d = 0; d < DIM; d++) {
+				if ((ptype[n] != eptVSite) && (ptype[n] != eptShell) && !nFreeze[gf][d]) {
+	         			sd_V = ism*sig[gt].V*gmx_rng_gaussian_table(gaussrand);
+					/* sdc.em is defined as exp(-delta_t/tau) in update.c*/
+				        v[n][d] = v[n][d]*sdc[gt].em + (invmass[n]*f[n][d] + accel[ga][d])*tau_t[gt]*(1 - sdc[gt].em) + sd_V;   
+				}
+                                else
+                                {
+                                 v[n][d] = 0.0; 
+                                } 
+			}
+                     //  if (n == 200) 
+                          printf("before %d %f %f %f %f %f %f \n", n, v[n][0], v[n][1], v[n][2], f[n][0], f[n][1], f[n][2]);
+
+                      }
+                }
+               
+        for (icg = cg0; (icg < cg1); icg = icg + fr->n_pi_grps){
+                   n1 = cgindex[icg];
+                   for (b = 0; b < 3; b++)
+                    {
+		/* transform velocities and positions to nm space*/
+	            nm_transform(&v[n1 + b], qv, fr->n_pi_grps, fr);
+                    nm_transform(&x[n1 + b], qx, fr->n_pi_grps, fr);
+                    k = 0;
+		/* evolution of a free ring polymer*/
+   		    for (a = icg; a < icg + fr->n_pi_grps; a++) {
+                        n0 = cgindex[a];
+                        n =  n0 + b;
+                        hm = 0.5 * md->massT[n];
+                  //      real omg = (fr->n_pi_grps*BOLTZ*ref_t[0]*2*M_PI*sqrt(md->massT[n]))/PLANCK;
+                        if (cFREEZE) {
+                                gf = cFREEZE[n];
+                        }
+                        if (cACC) {
+                                ga = cACC[n];
+                        }
+                        if (cTC) {
+                                gt = cTC[n];
+                        }
+
+			for (d = 0; d < DIM; d++) {
+				if ((ptype[n] != eptVSite) && (ptype[n] != eptShell) && !nFreeze[gf][d]) {
+                                      if (k == 0)
+                                        {
+                                        qvnew[k][d] = qv[k][d];
+                                        qx[k][d] = qv[k][d]*dt + qx[k][d]; 
+                                        }
+                                      else
+                                        {  
+                                        qvnew[k][d] = cos(fr->adress_NM_mu[k]*omg*dt) * qv[k][d] - omg * fr->adress_NM_mu[k] * sin(omg * fr->adress_NM_mu[k]*dt) *qx[k][d];
+                                        qx[k][d] = (1/(fr->adress_NM_mu[k]*omg)) * sin(fr->adress_NM_mu[k] * omg * dt) * qv[k][d] + cos(fr->adress_NM_mu[k] * omg * dt) * qx[k][d];
+                                        }
+                                        qv[k][d] = qvnew[k][d];                                      
+				} 
+			}
+                       
+                        for (d = 0; (d < DIM); d++) {
+                                for (m = 0; (m < DIM); m++) {
+                                        tcstat[gt].ekinh[m][d] += hm * qv[k][m] * qv[k][d];
+                                }
+                        }
+                      
+                        k++;
+                     }
+                 /* transform velocities and coordinates back to real space*/
+	           inverse_nm_transform(qv, &v[n1 + b], fr->n_pi_grps, fr);
+                   inverse_nm_transform(qx, &xprime[n1 + b], fr->n_pi_grps, fr);
+                  // xprime[n1+b][0] = x[n1+b][0], xprime[n1+b][1] = x[n1+b][1], xprime[n1+b][2] = x[n1+b][2];
+           } 
+        }
+
+           /*     for (icg = cg0; (icg < cg1); icg++) {
+                n0 = cgindex[icg];
+                n1 = cgindex[icg + 1];
+
+
+                for (n = n0; (n < n1); n++) {
+                      for (d = 0; d < DIM; d++)
+                         xprime[n][d] = x[n][d];
+               //   if (n == 200) 
+                     printf("after %d %f %f %f %f %f %f \n", n, v[n][0], v[n][1], v[n][2], xprime[n][0], xprime[n][1], xprime[n][2]);
+
+                      }
+                }*/
+ 
+
+
+	ekind->dekindl = dekindl;
+	inc_nrnb(nrnb, eNR_EKIN, nrend);
+
+	sfree(qv);
+	sfree(qvnew);
+        sfree(qx);
+
+}
+
+void update_coords_nm(
+		  t_inputrec   *inputrec,      /* input record and box stuff  */
+		  t_mdatoms    *md,
+		  t_state      *state,
+		  rvec         *f,        /* forces on home particles */
+		  gmx_update_t upd,
+		  gmx_localtop_t *top,
+		  t_commrec    *cr,
+		  t_forcerec   *fr,
+		  gmx_ekindata_t *ekind,
+		  t_nrnb *nrnb)
+{
+	double           dt,alpha;
+	rvec             *force;
+	real             dt_1;
+	int              start,homenr,nrend,i,j,d,n,m,g;
+	int             cg0,cg1,th,nth;
+	rvec             *xprime;
+
+	start  = md->start;
+	homenr = md->homenr;
+	nrend = start+homenr;
+
+	dt   = inputrec->delta_t;
+	dt_1 = 1.0/dt;
+
+	force = f;
+
+//	printf("update_coords_nm\n");
+//	printf("cr nodeid %d\n", cr->nodeid);
+	
+         if (PARTDECOMP(cr))
+	 {
+         //        printf("hi \n");
+		 pd_cg_range(cr,&cg0,&cg1);
+	 }
+	 else
+	 {
+		 cg0 = 0;
+		 if (DOMAINDECOMP(cr))
+		 {
+           //              printf("hi 1 \n");
+			 cg1 = cr->dd->ncg_home;
+		 }
+		 else
+		 {
+             //            printf("hi 2 \n");
+			 cg1 = top->cgs.nr;
+		 }
+	 }
+
+        // printf("cg0 %d cg1 %d \n", cg0, cg1);
+	 xprime = get_xprime(state,upd);
+
+         nth = gmx_omp_nthreads_get(emntUpdate);
+         
+#pragma omp parallel for num_threads(nth) schedule(static) private(alpha)
+         for (th = 0; th < nth; th++)  
+         {
+         int start_th, end_th;
+         start_th = start + ((nrend-start)* th   )/nth;
+         end_th   = start + ((nrend-start)*(th+1))/nth;
+	 do_update_sd1_nm(upd->sd, upd->sd->gaussrand[th], start_th, end_th,dt,
+			    inputrec->opts.acc,inputrec->opts.nFreeze,
+			    md->invmass,md->ptype,
+			    md->cFREEZE,md->cACC,md->cTC,
+			    state->x,xprime,state->v,force,state->sd_X,
+			    inputrec->opts.ngtc,inputrec->opts.tau_t,inputrec->opts.ref_t,
+			    cg0, cg1, &(top->cgs), cr, fr, ekind, nrnb, md, inputrec);
+         }
+
+}
+
+void InitNMMatrix(int P, t_forcerec *fr) {
+	int i, j, n;
+
+	real invP= 1.0/P;
+	real twopi=M_PI*2.0;
+     //   real omg = P*BOLTZ*ref_[t]*twopi/PLANK; 
+	snew(fr->adress_NM_M, P);
+	for(i=0; i< P;i++){
+		snew(fr->adress_NM_M[i], P);
+	}
+
+	for (i = 0; i < P; i++) {
+		for (j = 0; j < P; j++) {
+                        
+                        if (i == 0)
+                           {
+                              fr->adress_NM_M[i][j] = sqrt(invP);
+                           }
+                        else if (i >= 1 && i <= (P/2 - 1))
+                           {
+                              fr->adress_NM_M[i][j] = sqrt(2*invP)*cos(twopi*i*j*invP);
+                           }   
+                        else if (i == P/2)
+                           { 
+                              fr->adress_NM_M[i][j] = sqrt(invP)*pow(-1, j); 
+                           }
+                        else 
+                           {
+                              fr->adress_NM_M[i][j] = sqrt(2*invP)*sin(twopi*i*j*invP);
+                           }
+		//	fr->adress_NM_M[i][j]=(cos(twopi* i * j * invP) - sin(twopi*  i * j * invP))*sqrt(invP);
+                        printf("fr->adress_NM_M[i][j] = %f \n", fr->adress_NM_M[i][j]); 
+		}
+	}
+	snew(fr->adress_NM_mu, P);
+	for (i = 0; i < P; i++) {
+		fr->adress_NM_mu[i]=2.0*(sin(M_PI*i/P));
+                printf("fr->adress_NM_mu[i] = %f \n", fr->adress_NM_mu[i]);
+	}
+
+}
