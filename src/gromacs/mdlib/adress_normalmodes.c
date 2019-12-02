@@ -137,7 +137,7 @@ static rvec *get_xprime(const t_state *state,gmx_update_t upd)
 }
 
 
-void calc_force_on_cg(int cg0, int cg1, t_block * cgs, rvec x[], t_forcerec * fr, t_mdatoms * mdatoms, rvec f[])
+void calc_force_on_cg(int cg0, int cg1, t_block * cgs, t_mdatoms * mdatoms, rvec f[])
 {
     int            i, icg,k,k0,k1,d, nrcg;
     atom_id *      cgindex=cgs->index;;
@@ -203,10 +203,9 @@ static void inverse_nm_transform(rvec *x, rvec *u, int P, t_forcerec * fr)
     int i, j, d;
 
     real fac = sqrt(P);
-
     for (d = 0; d < DIM; d++)
     {
-        for (i = 0; i < P; j++)
+        for (i = 0; i < P; i++)
        	{
             u[i][d] = 0;
 
@@ -240,8 +239,8 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
     atom_id * cgindex=cgs->index;;
     int icg, n0, n1, n, nrcg, k, m, g, a, b, fp, bp;
     rvec * qv; /*velocity in nm space*/
-    rvec * qx; /*coordintates in nm space*/
-    rvec * qf; /*force in nm space*/
+    rvec * qf; /*coordintates in nm space*/
+    rvec * qx; /*force in nm space*/
     rvec * fh; 
     t_grpopts *opts = &inputrec->opts;
     t_grp_tcstat *tcstat = ekind->tcstat;
@@ -253,12 +252,13 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
 
 //    printf("cg0 %d, cg1 %d\n", cg0, cg1);
     
-    //printf( "do_update_sd1_nm omg %f \n", omg);
     
     snew(qv, fr->n_pi_grps);
     snew(qx, fr->n_pi_grps);
     snew(qf, fr->n_pi_grps);
     snew(fh, fr->n_pi_grps);
+    
+
 
     sdc = sd->sdc;
     sig = sd->sdsig;
@@ -328,11 +328,11 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
 		fh[n-n0][d] = f[n][d] - fdd + bdd;
 	    }
 	}
-
+	
 	nm_transform(&v[n0], qv, fr->n_pi_grps, fr);
 	nm_transform(&x[n0], qx, fr->n_pi_grps, fr);
         inverse_nm_transform(&fh[n0], qf, fr->n_pi_grps, fr);
-    
+
         for (n = n0; (n < n1); n++) 
         {
 
@@ -383,13 +383,15 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
 		    {
 		        kk       = md->massT[n] * omg * omg;
 			qf[k][d] = qf[k][d] - kk * fr->adress_NM_mu[k] * qx[k][d];
-			qv_temp  = qv[k][d] + ((invmass[n] / fr->adress_NM_mu[k]) * qf[k][d])*dt;
+//			qv[k][d] = qv[k][d] * (1 - sdc[gt].gdt) + (invmass[n] / fr->adress_NM_mu[k] * qf[k][d]) * tau_t[gt]*(1 - sdc[gt].em) + sd_V;
+			qv_temp  = qv[k][d] + (invmass[n] / fr->adress_NM_mu[k] * qf[k][d])*dt;
 			qv[k][d] = qv_temp*sdc[gt].em + sd_V;
 		    }
 		    else
 		    {
 			qv_temp  = qv[k][d] + (invmass[n] * qf[k][d])*dt;
 			qv[k][d] = qv_temp*sdc[gt].em + sd_V;
+//			qv[k][d] = qv[k][d] * (1 - sdc[gt].gdt) + (invmass[n] * qf[k][d]) * tau_t[gt]*(1 - sdc[gt].em) + sd_V;
 		    }
 		}
 		else
@@ -438,7 +440,7 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
 	inverse_nm_transform(qv, &v[n0], fr->n_pi_grps, fr);
 	inverse_nm_transform(qx, &xprime[n0], fr->n_pi_grps, fr);
     }
-    
+
     ekind->dekindl = dekindl;
     inc_nrnb(nrnb, eNR_EKIN, nrend);
     
@@ -446,6 +448,7 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
     sfree(qx);
     sfree(fh);
     sfree(qf);
+
 }
 
 void update_coords_nm(
@@ -477,7 +480,6 @@ void update_coords_nm(
     
     force = f;
     
-//    printf("update_coords_nm\n");
 //    printf("cr nodeid %d\n", cr->nodeid);
     
     cg0 = 0;
@@ -537,7 +539,7 @@ void InitNMMatrix(int P, t_forcerec *fr)
 	for (j = 0; j < P; j++)
 	{
 	    fr->adress_NM_M[i][j] = (cos(twopi * i * j * invP) -
-			             sin(twopi * i * i * invP)) * sqrt(invP);
+			             sin(twopi * i * j * invP)) * sqrt(invP);
 	}
     }
     
