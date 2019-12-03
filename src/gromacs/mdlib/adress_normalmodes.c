@@ -107,8 +107,8 @@ static gmx_stochd_t *init_stochd(t_inputrec *ir)
     }
     return sd;
 }
-
-/*gmx_update_t init_update(t_inputrec *ir)
+/*
+gmx_update_t init_update(t_inputrec *ir)
 {
     t_gmx_update *upd;
 
@@ -237,7 +237,7 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
     real ism, sd_V, fdd, bdd;
     int d;
     atom_id * cgindex=cgs->index;;
-    int icg, n0, n1, n, nrcg, k, m, g, a, b, fp, bp;
+    int icg, n0, n1, n, nrcg, k, m, g, a, b, c, fp, bp;
     rvec * qv; /*velocity in nm space*/
     rvec * qf; /*coordintates in nm space*/
     rvec * qx; /*force in nm space*/
@@ -252,13 +252,10 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
 
 //    printf("cg0 %d, cg1 %d\n", cg0, cg1);
     
-    
     snew(qv, fr->n_pi_grps);
     snew(qx, fr->n_pi_grps);
     snew(qf, fr->n_pi_grps);
     snew(fh, fr->n_pi_grps);
-    
-
 
     sdc = sd->sdc;
     sig = sd->sdsig;
@@ -331,7 +328,7 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
 	
 	nm_transform(&v[n0], qv, fr->n_pi_grps, fr);
 	nm_transform(&x[n0], qx, fr->n_pi_grps, fr);
-        inverse_nm_transform(&fh[n0], qf, fr->n_pi_grps, fr);
+        inverse_nm_transform(&fh[0], qf, fr->n_pi_grps, fr);
 
         for (n = n0; (n < n1); n++) 
         {
@@ -431,7 +428,7 @@ static void do_update_sd1_nm(gmx_stochd_t *sd,
 	    k = n - n0;
 	    for (d = 0; (d < DIM); d++)
 	    {
-	        qx[n][d] = qx[k][d] + qv[k][d]*dt;
+	        qx[k][d] = qx[k][d] + qv[k][d]*dt;
 	    }
 	}
 
@@ -494,7 +491,7 @@ void update_coords_nm(
      
     
     // printf("cg0 %d cg1 %d \n", cg0, cg1);
-     xprime = get_xprime(state,upd);
+     xprime = get_xprime(state, upd);
     
      nth = gmx_omp_nthreads_get(emntUpdate);
 	 
