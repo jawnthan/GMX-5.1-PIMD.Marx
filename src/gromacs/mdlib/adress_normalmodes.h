@@ -20,8 +20,6 @@ extern "C" {
 void calc_force_on_cg (int                  cg0,
 		         int                  cg1,
 			 t_block *            cgs,
-			 rvec                 x[],
-			 t_forcerec *         fr,
 			 t_mdatoms *          mdatoms,
 			 rvec       f[]);
 
